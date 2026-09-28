@@ -45,9 +45,8 @@ export function checkNullish(data:any){
     return data === undefined || data === null
 }
 
-const domSelect = true
 export async function selectSingleFile(ext:string[]){
-    if(domSelect){
+    if(!isTauri){
         const v = await selectFileByDom(ext, 'single')
         const file = v[0]
         return {name: file.name,data:await readFileAsUint8Array(file)}
@@ -163,7 +162,52 @@ export function getUserIconProtrait(){
     }
 }
 
-export function selectFileByDom(allowedExtensions:string[], multiple:'multiple'|'single' = 'single') {
+/**
+ * Opens the native file chooser through the Tauri dialog plugin and reads the
+ * selected files into `File` objects. On Linux this routes through the XDG
+ * Desktop Portal so that the desktop's native file picker (e.g. KDE) is used,
+ * instead of the WebKitGTK `<input type="file">` chooser.
+ */
+/**
+ * Opens the native file chooser and returns the selected paths without
+ * reading them. Use this when the file may be large and should be streamed
+ * (e.g. full local backups), so it is never fully materialized in JS memory.
+ */
+export async function selectNativeFilePaths(allowedExtensions:string[], multiple:boolean):Promise<string[]> {
+    const acceptAll = (getDatabase().allowAllExtentionFiles || isIOS() || allowedExtensions[0] === '*')
+    const filters = (acceptAll || !allowedExtensions?.length)
+        ? []
+        : [{
+            name: allowedExtensions.join(', '),
+            extensions: allowedExtensions.map(ext => ext.replace(/^\./, ''))
+        }]
+    const selected = await open({
+        filters,
+        multiple
+    })
+    if (selected === null) {
+        return []
+    }
+    return Array.isArray(selected) ? selected : [selected]
+}
+
+async function selectFilesByTauriDialog(allowedExtensions:string[], multiple:boolean):Promise<File[]> {
+    const paths = await selectNativeFilePaths(allowedExtensions, multiple)
+    const files: File[] = []
+    for (const path of paths) {
+        const data = await readFile(path)
+        files.push(new File([asBuffer(data)], await basename(path)))
+    }
+    return files
+}
+
+export async function selectFileByDom(allowedExtensions:string[], multiple:'multiple'|'single' = 'single') {
+    if(isTauri){
+        // Tauri's own file dialog is used so the platform-native picker is
+        // shown. The WebKitGTK `<input type="file">` chooser does not open
+        // reliably on Wayland (KDE Plasma) and is avoided here.
+        return selectFilesByTauriDialog(allowedExtensions, multiple === 'multiple')
+    }
     return new Promise<null|File[]>((resolve) => {
         const fileInput = document.createElement('input');
         fileInput.type = 'file';

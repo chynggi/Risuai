@@ -1,4 +1,4 @@
-import { BaseDirectory, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, open as openFileHandle, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
 import { LocalWriter, forageStorage, requiresFullEncoderReload } from "../globalApi.svelte";
@@ -6,7 +6,7 @@ import { isTauri } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, setDatabaseLite } from "../storage/database.svelte";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { decryptBuffer, encryptBuffer, sleep } from "../util";
+import { decryptBuffer, encryptBuffer, selectNativeFilePaths, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
@@ -402,40 +402,50 @@ export async function SavePartialLocalBackup(){
     }
 }
 
-export function LoadLocalBackup(){
+export async function LoadLocalBackup(){
     try {
-        const input = document.createElement('input');
-        const encryptionMeta:{
-            type: 'none' | 'account';
-            time?: number;
-        } = {
-            type: 'none'
+        const paths = await selectNativeFilePaths(['bin'], false)
+        if (!paths.length) {
+            return
         }
-        input.type = 'file';
-        input.accept = '.bin';
-        input.onchange = async () => {
-            if (!input.files || input.files.length === 0) {
-                input.remove();
-                return;
-            }
-            const file = input.files[0];
-            input.remove();
+        await restoreLocalBackupFromPath(paths[0])
+    } catch (error) {
+        console.error(error);
+        alertError('Failed, Is file corrupted?')
+    }
+}
 
-            const reader = file.stream().getReader();
+export async function restoreLocalBackupFromPath(path:string){
+    const encryptionMeta:{
+        type: 'none' | 'account';
+        time?: number;
+    } = {
+        type: 'none'
+    }
+
+    // Stream the backup from disk in chunks instead of reading it fully into
+    // memory: local backups can be multiple gigabytes.
+    const handle = await openFileHandle(path, { read: true })
+    try {
+        const totalSize = (await handle.stat()).size ?? 0
+
+        const restoreFromFile = async () => {
             const CHUNK_SIZE = 1024 * 1024; // 1MB chunk size
+            const readBuffer = new Uint8Array(CHUNK_SIZE);
             let bytesRead = 0;
             let remainingBuffer = new Uint8Array();
             let pendingDatabase: Uint8Array | null = null;
             const restoredColdStorageKeys = new Set<string>();
 
             while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
+                const readBytes = await handle.read(readBuffer);
+                if (!readBytes) {
                     break;
                 }
+                const value = readBuffer.subarray(0, readBytes);
 
                 bytesRead += value.length;
-                const progress = ((bytesRead / file.size) * 100).toFixed(2);
+                const progress = ((bytesRead / totalSize) * 100).toFixed(2);
                 alertWait(`Loading local Backup... (${progress}%)`);
 
                 const newBuffer = new Uint8Array(remainingBuffer.length + value.length);
@@ -577,9 +587,8 @@ export function LoadLocalBackup(){
             alertNormal('Success');
         };
 
-        input.click();
-    } catch (error) {
-        console.error(error);
-        alertError('Failed, Is file corrupted?')
+        await restoreFromFile();
+    } finally {
+        await handle.close();
     }
 }

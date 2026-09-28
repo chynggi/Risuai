@@ -13,6 +13,7 @@
     import { onDestroy, onMount } from "svelte";
     import { DBState } from "src/ts/stores.svelte";
     import { RISU_EFFECT_DRAG_TYPE, RISU_TRIGGER_DRAG_TYPE } from "src/ts/dragTypes";
+    import { selectFileByDom } from "src/ts/util";
 
     interface Props {
         value?: triggerscript[];
@@ -496,13 +497,11 @@
         lastSelectedTriggerIndex = -1
     }
 
-    const importTriggers = () => {
-        const input = document.createElement('input')
-        input.type = 'file'
-        input.accept = '.json'
-        input.onchange = async (event) => {
-            const file = (event.target as HTMLInputElement)?.files?.[0]
-            if (!file) return
+    const importTriggers = async () => {
+        const files = await selectFileByDom(['json'], 'single')
+        const file = files?.[0]
+        if (!file) return
+        const importFile = async () => {
             
             try {
                 const text = await file.text()
@@ -531,8 +530,8 @@
                 console.error('Import error:', error)
             }
         }
-        
-        input.click()
+
+        await importFile()
     }
 
     const selectTriggerRange = (startIndex: number, endIndex: number) => {
