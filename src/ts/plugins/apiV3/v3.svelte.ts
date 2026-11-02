@@ -14,7 +14,7 @@ import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type Color
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
-import { getColdStorageItem, setColdStorageItem } from "src/ts/process/coldstorage.svelte";
+import { pluginStorage } from "src/ts/process/coldstorage.svelte";
 import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher, risuChatParser, type CbsConditions } from "src/ts/parser/parser.svelte";
@@ -37,6 +37,7 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
+import isEqual from "lodash/isEqual";
 
 /*
     V3 API for RisuAI Plugins
@@ -58,17 +59,25 @@ import {
 */
 
 const pluginChannel = new Map<string, Function>();
-const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
+type TrackedEventListener = {
+    eventTarget: EventTarget
+    type: string
+    listener: EventListenerOrEventListenerObject
+    options: AddEventListenerOptions
+};
+const pluginEventListeners: TrackedEventListener[] = [];
 
 class SafeElement {
     #element: HTMLElement;
+    #eventTarget: EventTarget;  // Differs from #element for SafeDocument
     __classType = 'REMOTE_REQUIRED' as const;
 
-    constructor(element: HTMLElement) {
+    constructor(element: HTMLElement, eventTarget?: EventTarget) {
         if(element.getAttribute('freezed')){
             throw new Error("This element cannot be accessed by SafeELement")
         }
         this.#element = element;
+        this.#eventTarget = eventTarget ?? element;
     }
 
     public appendChild(child: SafeElement) {
@@ -242,7 +251,7 @@ class SafeElement {
     public scrollIntoView(options?: boolean | ScrollIntoViewOptions) {
         this.#element.scrollIntoView(options);
     }
-    #eventIdMap = new Map<string, Function>()
+    #eventIdMap = new Map<string, TrackedEventListener>()
 
     public async addEventListener(type:string, listener: (event: any) => void, options?: boolean | AddEventListenerOptions):Promise<string> {
         const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
@@ -317,9 +326,15 @@ class SafeElement {
             const modifiedListener = (event: any) => {
                 listener(trimEvent(event))
             }
-            this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
-            document.addEventListener(type, modifiedListener, realOptions)
+            const tracked: TrackedEventListener = {
+                eventTarget: this.#eventTarget,
+                type,
+                listener: modifiedListener as EventListenerOrEventListenerObject,
+                options: realOptions,
+            };
+            this.#eventIdMap.set(id, tracked);
+            pluginEventListeners.push(tracked);
+            tracked.eventTarget.addEventListener(tracked.type, tracked.listener, tracked.options);
             return id;
         }
         else if(allowedDelayedEventListeners.includes(type)){
@@ -332,9 +347,15 @@ class SafeElement {
                     listener(trimEvent(event));
                 }, delay);
             }
-            this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
-            document.addEventListener(type, modifiedListener, realOptions);
+            const tracked: TrackedEventListener = {
+                eventTarget: this.#eventTarget,
+                type,
+                listener: modifiedListener as EventListenerOrEventListenerObject,
+                options: realOptions,
+            };
+            this.#eventIdMap.set(id, tracked);
+            pluginEventListeners.push(tracked);
+            tracked.eventTarget.addEventListener(tracked.type, tracked.listener, tracked.options);
             return id;
         }
         else{
@@ -343,12 +364,13 @@ class SafeElement {
     }
 
     public removeEventListener(type:string, id:string, options?: boolean | EventListenerOptions) {
-        const listener = this.#eventIdMap.get(id);
-        if(listener){
-            const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
-            document.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
-            const idx = documentEventListeners.findIndex(e => e.listener === listener);
-            if(idx !== -1) documentEventListeners.splice(idx, 1);
+        // type/options are unused, but are kept in the signature for API compatibility
+        // DOM removal silently no-ops if type/capture don't exactly match the registration, so the stored record is replayed instead
+        const tracked = this.#eventIdMap.get(id);
+        if(tracked){
+            tracked.eventTarget.removeEventListener(tracked.type, tracked.listener, tracked.options);
+            const idx = pluginEventListeners.indexOf(tracked);
+            if(idx !== -1) pluginEventListeners.splice(idx, 1);
             this.#eventIdMap.delete(id);
         }
     }
@@ -361,7 +383,8 @@ class SafeElement {
 class SafeDocument extends SafeElement {
     __classType = 'REMOTE_REQUIRED' as const;
     constructor(document: Document) {
-        super(document.documentElement);
+        // document-level events (including viewport scroll) are bound to the Document
+        super(document.documentElement, document);
     }
     createElement(tagName: string): SafeElement {
         if(!tagWhitelist.includes(tagName.toLowerCase())) {
@@ -394,6 +417,7 @@ type SafeMutationRecordObject = {
     type: string;
     target: SafeElement;
     addedNodes: SafeElement[];
+    removedNodes: SafeElement[];
 }
 
 class SafeClassArray<T> {
@@ -418,10 +442,12 @@ class SafeMutationRecord{
     #type: string;
     #target: SafeElement;
     #addedNodes: SafeClassArray<SafeElement>;
-    constructor(type: string, target: SafeElement, addedNodes: SafeElement[]) {
+    #removedNodes: SafeClassArray<SafeElement>;
+    constructor(type: string, target: SafeElement, addedNodes: SafeElement[], removedNodes: SafeElement[]) {
         this.#type = type;
         this.#target = target;
         this.#addedNodes = new SafeClassArray<SafeElement>(addedNodes);
+        this.#removedNodes = new SafeClassArray<SafeElement>(removedNodes);
     }
     getType(): string {
         return this.#type;
@@ -431,6 +457,9 @@ class SafeMutationRecord{
     }
     getAddedNodes(): SafeClassArray<SafeElement> {
         return this.#addedNodes;
+    }
+    getRemovedNodes(): SafeClassArray<SafeElement> {
+        return this.#removedNodes;
     }
 }
 
@@ -467,7 +496,8 @@ class SafeMutationObserver {
                 safeClassed.push(new SafeMutationRecord(
                     record.type,
                     record.target,
-                    record.addedNodes
+                    record.addedNodes,
+                    record.removedNodes,
                 ));
             }
             callback(safeClassed);
@@ -732,11 +762,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 return;
             }
             oldApis.addRisuReplacer(name, func as any);
+            addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuReplacer(name, func as any));
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
             //permission check, lets use same as replacer
-            const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
+            const conf = await getPermission('replacer', 'periodically');
             if(!conf){
                 return;
             }
@@ -744,12 +775,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
         },
         removeRisuChatListener: oldApis.removeRisuChatListener,
-        setDatabaseLite: oldApis.setDatabaseLite,
+        setDatabaseLite: (newDb: any) => {
+            if(newDb && Object.hasOwn(newDb, 'plugins')){
+                if(import.meta.env.DEV && !isEqual(newDb.plugins, $state.snapshot(DBState.db.plugins))){
+                    console.warn(`Plugin "${plugin.name}" attempted to modify the plugin list using setDatabaseLite. The change was ignored.`);
+                }
+
+                const safeDb = {...newDb};
+                delete safeDb.plugins;
+                return oldApis.setDatabaseLite(safeDb);
+            }
+
+            return oldApis.setDatabaseLite(newDb);
+        },
         setDatabase: oldApis.setDatabase,
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
-            const conf = await getPluginPermission(plugin.name, 'inlay', 'periodically');
+            const conf = await getPermission('inlay', 'periodically');
             if(!conf){
                 return null;
             }
@@ -1271,58 +1314,28 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        //pluginStorage is coldstorage-backed for v3: values live in cold storage,
-        //db.pluginCustomStorage._coldplugin only keeps the key -> coldstorage id map
-        _getPluginStorage: async (key: string) => {
-            const db = getDatabase()
-            const coldId = db.pluginCustomStorage?._coldplugin?.[key]
-            if(!coldId){
-                return null
-            }
-            const value = await getColdStorageItem(coldId)
-            return value ?? null
-        },
-        _setPluginStorage: async (key: string, value: any) => {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            db.pluginCustomStorage._coldplugin ??= {}
-            let coldId: string = db.pluginCustomStorage._coldplugin[key]
-            if(!coldId){
-                coldId = v4()
-                db.pluginCustomStorage._coldplugin[key] = coldId
-            }
-            await setColdStorageItem(coldId, value)
-        },
-        _removePluginStorage: async (key: string) => {
-            const db = getDatabase()
-            if(db.pluginCustomStorage?._coldplugin){
-                delete db.pluginCustomStorage._coldplugin[key]
-            }
-        },
-        _clearPluginStorage: async () => {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            db.pluginCustomStorage._coldplugin = {}
-        },
+        //pluginStorage is coldstorage-backed (see process/pluginStorageStore.ts)
+        _getPluginStorage: (key: string) => pluginStorage.getItem(key),
+        _setPluginStorage: (key: string, value: any) => pluginStorage.setItem(key, value),
+        _removePluginStorage: (key: string) => pluginStorage.removeItem(key),
+        _clearPluginStorage: () => pluginStorage.clear(),
         _keyPluginStorage: async (index: number) => {
-            const db = getDatabase()
-            const keys = Object.keys(db.pluginCustomStorage?._coldplugin ?? {})
-            return keys[index] ?? null
+            return (await pluginStorage.keys())[index] ?? null
         },
-        _keysPluginStorage: async () => {
-            const db = getDatabase()
-            return Object.keys(db.pluginCustomStorage?._coldplugin ?? {})
-        },
+        _keysPluginStorage: () => pluginStorage.keys(),
         _lengthPluginStorage: async () => {
-            const db = getDatabase()
-            return Object.keys(db.pluginCustomStorage?._coldplugin ?? {}).length
+            return (await pluginStorage.keys()).length
         },
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: oldApis.safeLocalStorage.setItem,
         _removeSafeLocalStorage: oldApis.safeLocalStorage.removeItem,
-        _clearSafeLocalStorage: oldApis.safeLocalStorage.clear,
-        _keySafeLocalStorage: oldApis.safeLocalStorage.key,
+        //bound calls: SafeLocalStorage.key/clear use `this`
+        _clearSafeLocalStorage: () => oldApis.safeLocalStorage.clear(),
+        _keySafeLocalStorage: (index: number) => oldApis.safeLocalStorage.key(index),
         _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
+        _lengthSafeLocalStorage: () => {
+            return oldApis.safeLocalStorage.length
+        },
         searchTranslationCache: async (partialKey: string) => {
             return searchLLMCache(partialKey)
         },
@@ -1347,6 +1360,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     'clear': '_clearSafeLocalStorage',
                     'key': '_keySafeLocalStorage',
                     'keys': '_keysSafeLocalStorage',
+                    'length': '_lengthSafeLocalStorage',
                 }
             }
         },
@@ -1470,14 +1484,15 @@ type V3PluginInstance = {
 const v3PluginInstances: V3PluginInstance[] = [];
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
-    await Promise.all(v3PluginInstances.map(async (instance) => {
+    // iterate over a copy: unloadV3Plugin removes the instance from v3PluginInstances
+    await Promise.all([...v3PluginInstances].map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
 
-    for(const entry of documentEventListeners){
-        document.removeEventListener(entry.type, entry.listener, entry.options);
+    for(const entry of pluginEventListeners){
+        entry.eventTarget.removeEventListener(entry.type, entry.listener, entry.options);
     }
-    documentEventListeners.length = 0;
+    pluginEventListeners.length = 0;
 
     const loadPromises = plugins.map(plugin => executePluginV3(plugin));
     await Promise.all(loadPromises);

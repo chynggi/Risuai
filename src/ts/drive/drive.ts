@@ -1,4 +1,4 @@
-import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
+import { alertConfirm, alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
 import { getDatabase, type Database } from "../storage/database.svelte";
 import { forageStorage, getUncleanables, openURL } from "../globalApi.svelte";
 import { isTauri } from "src/ts/platform"
@@ -7,16 +7,24 @@ import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { decodeRisuSave, encodeRisuSave } from "../storage/risuSave";
+import { saveKV, saveKVSourceFromData, type SaveKVData } from "../storage/saveKV";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isValidColdStorageItem, listColdDataKeysFromDb, listPluginStorageColdKeys, pluginStorage, setColdStorageItem } from "../process/coldstorage.svelte";
+
+const driveStateKey = 'risuDriveState'
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
     const REDIRECT_URI = type === 'reftoken' ? 'https://sv.risuai.xyz/drive' : "https://risuai.xyz/"
     const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.appdata';
     const encodedRedirectUri = encodeURIComponent(REDIRECT_URI);
-    const authorizationUrl = `https://accounts.google.com/o/oauth2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodedRedirectUri}&scope=${SCOPE}&response_type=code&state=${type}`;
-    
+    let state:string = type
+    if(type === 'save' || type === 'load'){
+        state = `${type}.${crypto.randomUUID()}`
+        sessionStorage.setItem(driveStateKey, state)
+    }
+    const authorizationUrl = `https://accounts.google.com/o/oauth2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodedRedirectUri}&scope=${SCOPE}&response_type=code&state=${encodeURIComponent(state)}`;
+
 
     if(type === 'reftoken'){
         const authorizationUrl = `https://accounts.google.com/o/oauth2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodedRedirectUri}&scope=${SCOPE}&response_type=code&state=${"accesstauri"}&access_type=offline&prompt=consent`;
@@ -57,28 +65,42 @@ export async function checkDriverInit() {
     try {
         const loc = new URLSearchParams(location.search)
         const code = loc.get('code')
-    
+
         if(code){
+            const state = loc.get('state') ?? ''
+            const action = state.split('.')[0]
+            if(action === 'save' || action === 'load'){
+                const expectedState = sessionStorage.getItem(driveStateKey)
+                sessionStorage.removeItem(driveStateKey)
+                const currentURL = new URL(location.href)
+                currentURL.search = ''
+                window.history.replaceState({}, "", currentURL.href)
+                if(!expectedState || state !== expectedState){
+                    alertError(language.driveAuthInvalid)
+                    return false
+                }
+            }
             const res = await fetch(hubURL + `/drive/token?code=${encodeURIComponent(code)}`)
             if(res.status >= 200 && res.status < 300){
                 const json:{
                     access_token:string,
                     expires_in:number
                 } = await res.json()
-                const da = loc.get('state')
-                if(da === 'save'){
-                    await backupDrive(json.access_token)
+                if(action === 'save'){
+                    if(await alertConfirm(language.backupConfirm)){
+                        await backupDrive(json.access_token)
+                    }
                 }
-                else if(da === 'load'){
+                else if(action === 'load'){
                     await loadDrive(json.access_token, 'backup')
                 }
-                else if(da === 'savetauri' || da === 'loadtauri'){
+                else if(state === 'savetauri' || state === 'loadtauri'){
                     alertStore.set({
                         type: 'wait2',
                         msg: `Copy and paste this Auth Code: ${json.access_token}`
                     })
                 }
-                else if(da === 'accesstauri'){
+                else if(state === 'accesstauri'){
                     alertStore.set({
                         type: 'wait2',
                         msg: JSON.stringify(json)
@@ -177,13 +199,14 @@ async function backupDrive(ACCESS_TOKEN:string) {
             type: "wait",
             msg: `Uploading Cold Storage... (${i + 1} / ${coldStoragePayloads.payloads.length})`
         })
+        //cold storage items never change under the same key, so existing uploads can be skipped
         if(fileNames.includes(payload.backupName)){
             continue
         }
         await createFileInFolder(ACCESS_TOKEN, payload.backupName, payload.encoded)
     }
 
-    const dbData = encodeRisuSaveLegacy(getDatabase(), 'compression')
+    const dbData = await encodeRisuSave(getDatabase(), { compression: true, kv: saveKV })
 
     alertStore.set({
         type: "wait",
@@ -284,7 +307,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                 msg: "Sync Data..."
             })
         }
-        async function getDbFromList(){
+        async function getDbFromList(): Promise<{ database: Database, kv: SaveKVData }>{
             let selectables:string[] = []
             for(let i=0;i<dbs.length;i++){
                 selectables.push(`Backup saved in ${(new Date(dbs[i][1] * 1000)).toLocaleString()}`)
@@ -294,11 +317,13 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
             }
             const selectedIndex = (await alertSelect([language.loadLatest, language.loadOthers]) === '0') ? 0 : parseInt(await alertSelect(selectables))
             const selectedDb = dbs[selectedIndex][0]
-            const decompressedDb:Database = await decodeRisuSave(await getFileData(ACCESS_TOKEN, selectedDb.id))
-            return decompressedDb
+            return await decodeRisuSave(await getFileData(ACCESS_TOKEN, selectedDb.id))
         }
     
-        const db:Database = mode === 'backup' ? await getDbFromList() : JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8'))
+        //sync data is plain JSON and carries no SaveKV data
+        const { database: db, kv }: { database: Database, kv: SaveKVData } = mode === 'backup'
+            ? await getDbFromList()
+            : { database: JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8')), kv: {} }
         const coldStorageRestoreFailures = await restoreColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
         if(coldStorageRestoreFailures.length > 0){
             if(mode === 'sync'){
@@ -360,7 +385,8 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
             }
         }
         db.didFirstSetup = true
-        const dbData = encodeRisuSaveLegacy(db, 'compression')
+        //a restored backup brings its own SaveKV data; sync data has none, so this device's data is kept
+        const dbData = await encodeRisuSave(db, { compression: true, kv: mode === 'sync' ? saveKV : saveKVSourceFromData(kv) })
 
         if(isTauri){
             await writeFile('database/database.bin', dbData, {baseDir: BaseDirectory.AppData})
@@ -394,41 +420,62 @@ async function restoreColdStorageFromDrive(
     db:Database,
     mode:'backup'|'sync'
 ) {
-    const coldKeys = await listColdDataKeys(db)
     const failures:string[] = []
-    for(let i=0;i<coldKeys.length;i++){
-        const key = coldKeys[i]
-        const names = new Set([
-            getColdStorageBackupName(key),
-            `coldstorage/${key}.json`,
-            `${key}.json`
-        ])
-        const file = files.find((driveFile) => names.has(driveFile.name))
-        if(!file){
-            console.warn(`Cold storage data not found in Drive backup: ${key}`)
-            failures.push(key)
-            continue
-        }
-        alertStore.set({
-            type: "wait",
-            msg: `${mode === 'sync' ? 'Sync' : 'Loading Backup'} Cold Storage... (${i + 1} / ${coldKeys.length})`
-        })
-        try {
-            const jsonData = JSON.parse(new TextDecoder().decode(await getFileData(ACCESS_TOKEN, file.id)))
-            if(isColdStorageBackupData(jsonData)){
-                if(!await setColdStorageItem(key, jsonData)){
+    const restored = new Set<string>()
+    const legacyPluginStorageKeys = new Set(listPluginStorageColdKeys(db))
+
+    const restoreKeys = async (keys:string[], pluginStorageKeys:Set<string>) => {
+        for(let i=0;i<keys.length;i++){
+            const key = keys[i]
+            if(restored.has(key)){
+                continue
+            }
+            restored.add(key)
+            const names = new Set([
+                getColdStorageBackupName(key),
+                `coldstorage/${key}.json`,
+                `${key}.json`
+            ])
+            const file = files.find((driveFile) => names.has(driveFile.name))
+            if(!file){
+                console.warn(`Cold storage data not found in Drive backup: ${key}`)
+                failures.push(key)
+                continue
+            }
+            alertStore.set({
+                type: "wait",
+                msg: `${mode === 'sync' ? 'Sync' : 'Loading Backup'} Cold Storage... (${i + 1} / ${keys.length})`
+            })
+            try {
+                const jsonData = JSON.parse(new TextDecoder().decode(await getFileData(ACCESS_TOKEN, file.id)))
+                if(isValidColdStorageItem(jsonData, pluginStorageKeys.has(key))){
+                    if(!await setColdStorageItem(key, jsonData)){
+                        failures.push(key)
+                    }
+                }
+                else{
+                    console.warn(`Skipping invalid cold storage Drive item ${file.name}`)
                     failures.push(key)
                 }
-            }
-            else{
-                console.warn(`Skipping invalid cold storage Drive item ${file.name}`)
+            } catch (error) {
+                console.error(`Failed to restore cold storage item ${key}:`, error)
                 failures.push(key)
             }
-        } catch (error) {
-            console.error(`Failed to restore cold storage item ${key}:`, error)
-            failures.push(key)
         }
     }
+
+    //first pass: character/chat data, legacy plugin storage items and the plugin storage index
+    const indexPointer = db.pluginCustomStorage?._coldpluginIndex
+    const firstPassPluginKeys = new Set(legacyPluginStorageKeys)
+    if(typeof indexPointer === 'string'){
+        firstPassPluginKeys.add(indexPointer)
+    }
+    await restoreKeys(listColdDataKeysFromDb(db), firstPassPluginKeys)
+
+    //second pass: large plugin storage values, listed inside the (now restored) index
+    const pluginStorageKeys = new Set(await pluginStorage.referencedIds(db.pluginCustomStorage))
+    await restoreKeys(Array.from(pluginStorageKeys), pluginStorageKeys)
+
     return failures
 }
 
